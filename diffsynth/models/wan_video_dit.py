@@ -31,6 +31,108 @@ from block_sparse_attn import block_sparse_attn_func
 from PIL import Image
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Hopper adaptive attention backend.
+#
+# Measured on GH200 @768x1408 (seq=25344, 12 heads, dim=128): the block-sparse
+# self-attention runs at block-mask density ~0.606 and takes ~7.3 ms, while
+# cuDNN's fused dense SDPA computes the FULL attention in ~6.5 ms (605 TFLOP/s).
+# i.e. at high density the sparse kernel is slower than dense AND drops context.
+#
+# When the block mask is dense enough (density >= threshold) we route to cuDNN
+# fused dense attention instead of the sparse kernel: faster and uses full
+# context. Below the threshold the sparse kernel wins, so we keep it.
+#
+# Knob: FLASHVSR_ATTN_BACKEND = sparse | triton | auto | dense
+#   sparse -> always block_sparse (DEFAULT = original behaviour, no quality change)
+#   triton -> Hopper WGMMA block-sparse kernel: exact same mask, output matches
+#             block_sparse very closely (~49.7 dB PSNR end-to-end; the only
+#             difference is WGMMA vs HMMA accumulation order). ~1.2x faster than
+#             block_sparse at the kernel level (~+9% end-to-end). sm_90 only;
+#             silently falls back to block_sparse elsewhere / on error.
+#   auto   -> density-adaptive: dense if density>=FLASHVSR_ATTN_DENSE_THRESH
+#   dense  -> always cuDNN fused dense
+# FLASHVSR_ATTN_DENSE_THRESH default 0.5 (the measured crossover point).
+#
+# NOTE: routing to dense changes the output (it uses FULL attention instead of
+# the trained locality-constrained sparse pattern, which measurably lowers PSNR),
+# and at the default density the E2E gain is negligible, so the default stays
+# 'sparse'. The knob exists for future aggressive-sparsity experiments (lower
+# topk -> lower density -> sparse wins big, see docs).
+# ---------------------------------------------------------------------------
+_ATTN_BACKEND = os.environ.get("FLASHVSR_ATTN_BACKEND", "sparse").lower()
+_ATTN_DENSE_THRESH = float(os.environ.get("FLASHVSR_ATTN_DENSE_THRESH", "0.5"))
+
+# ---------------------------------------------------------------------------
+# Norm / elementwise fusion (Phase 3-B).
+#
+# The DiT block is dominated (~17% of denoise GPU time) by memory-bound
+# elementwise kernels: RMSNorm (q/k, with an fp32 up/down cast), LayerNorm,
+# modulate (x*(1+scale)+shift) and the gate (x + gate*residual). torch.compile
+# fuses each chain into a single kernel; in isolation the fused RMSNorm is
+# several times faster than the eager path (the exact ratio depends on the
+# tensor shape), at near-identical precision (cos ~1.0).
+# These functions contain no attention / custom kernels, so compiling them does
+# not interact with the block_sparse path or the streaming cache. End-to-end the
+# fusion is measured at ~49 dB PSNR vs the unfused path (see test_fuse_norm.py).
+#
+# Knob FLASHVSR_FUSE_NORM = 0 | 1 (default off; opt-in, parity-gated).
+# ---------------------------------------------------------------------------
+_FUSE_NORM = os.environ.get("FLASHVSR_FUSE_NORM", "0") != "0"
+
+# ---------------------------------------------------------------------------
+# Lossless step-invariant caches (Phase B).
+#
+# Several per-block elementwise results are recomputed on every denoise step but
+# depend only on fixed inputs (parameters + the once-computed timestep modulation
+# t_mod), NOT on x / q / k. Caching them is bit-identical (max|diff|==0).
+#
+# B1  FLASHVSR_CACHE_MOD       = 0 | 1  -> cache (modulation + t_mod).chunk(...)
+#                                          per DiTBlock / Head.
+# B2  FLASHVSR_CACHE_MASK_BIAS = 0 | 1  -> cache the local_attn_mask additive bias
+#                                          (0/-inf) in generate_draft_block_mask.
+# Both default OFF (opt-in), pure elementwise, silent fallback. They do not touch
+# attention / the streaming cache, so they compose with every other knob.
+# ---------------------------------------------------------------------------
+_CACHE_MOD = os.environ.get("FLASHVSR_CACHE_MOD", "0") != "0"
+_CACHE_MASK_BIAS = os.environ.get("FLASHVSR_CACHE_MASK_BIAS", "0") != "0"
+
+
+def _maybe_compile(fn):
+    if not _FUSE_NORM:
+        return fn
+    try:
+        return torch.compile(fn, dynamic=True)
+    except Exception:
+        return fn
+
+try:
+    from torch.nn.attention import sdpa_kernel as _sdpa_kernel, SDPBackend as _SDPBackend
+    _CUDNN_SDPA_OK = True
+except Exception:
+    _CUDNN_SDPA_OK = False
+
+# Triton WGMMA block-sparse attention kernel (optional; sm_90 fast path).
+try:
+    from .triton_block_sparse_attn import triton_block_sparse_attention as _TRITON_BSA
+except Exception:
+    _TRITON_BSA = None
+
+
+def _is_hopper_dev(device):
+    try:
+        return device.type == "cuda" and torch.cuda.get_device_capability(device) == (9, 0)
+    except Exception:
+        return False
+
+
+def _dense_sdpa(q_bnsd):
+    """cuDNN fused dense attention on (B, heads, S, D) layout."""
+    if _CUDNN_SDPA_OK:
+        with _sdpa_kernel(_SDPBackend.CUDNN_ATTENTION):
+            return F.scaled_dot_product_attention(*q_bnsd)
+    return F.scaled_dot_product_attention(*q_bnsd)
+
 
 # ----------------------------
 # Local / window masks
@@ -112,6 +214,23 @@ class WindowPartition3D:
         return x.view(B, F, H, W, -1)
 
 
+# B2: process-wide cache for the geometry-only additive attention bias.
+_MASK_BIAS_CACHE = {}
+
+
+def _build_mask_bias(local_attn_mask, repeat_head, repeat_len, repeat_num):
+    """Build the (repeat_head, S, S) 0/-inf additive bias from the boolean local
+    block mask. Exact re-expression of the original inline code (lines below) so
+    cached and uncached paths are bit-identical."""
+    m = local_attn_mask.unsqueeze(1).unsqueeze(0).repeat(repeat_len, 1, repeat_num, 1)
+    m = rearrange(m, 'x a y b -> (x a) (y b)')
+    m = m.unsqueeze(0).repeat(repeat_head, 1, 1)
+    m = m.to(torch.float32)
+    m = m.masked_fill(m == False, -float('inf'))
+    m = m.masked_fill(m == True, 0)
+    return m
+
+
 @torch.no_grad()
 def generate_draft_block_mask(batch_size, nheads, seqlen,
                               q_w, k_w, topk=10, local_attn_mask=None):
@@ -129,13 +248,22 @@ def generate_draft_block_mask(batch_size, nheads, seqlen,
     repeat_head = scores.shape[0]
     repeat_len = scores.shape[1] // local_attn_mask.shape[0]
     repeat_num = scores.shape[2] // local_attn_mask.shape[1]
-    local_attn_mask = local_attn_mask.unsqueeze(1).unsqueeze(0).repeat(repeat_len, 1, repeat_num, 1)
-    local_attn_mask = rearrange(local_attn_mask, 'x a y b -> (x a) (y b)')
-    local_attn_mask = local_attn_mask.unsqueeze(0).repeat(repeat_head, 1, 1)
-    local_attn_mask = local_attn_mask.to(torch.float32)
-    local_attn_mask = local_attn_mask.masked_fill(local_attn_mask == False, -float('inf'))
-    local_attn_mask = local_attn_mask.masked_fill(local_attn_mask == True, 0)
-    scores = scores + local_attn_mask
+
+    # B2 lossless cache: the additive bias (0 / -inf) depends only on the geometry
+    # (local_attn_mask + repeat factors), not on q/k, so it is identical across
+    # every block and every step. Recomputing it (repeat + 2x masked_fill + cast)
+    # each call is pure overhead. Cache it keyed on those shape-only inputs.
+    bias = None
+    if _CACHE_MASK_BIAS:
+        key = (id(local_attn_mask), repeat_head, repeat_len, repeat_num,
+               local_attn_mask.device, scores.shape[1], scores.shape[2])
+        bias = _MASK_BIAS_CACHE.get(key)
+        if bias is None:
+            bias = _build_mask_bias(local_attn_mask, repeat_head, repeat_len, repeat_num)
+            _MASK_BIAS_CACHE[key] = bias
+    if bias is None:
+        bias = _build_mask_bias(local_attn_mask, repeat_head, repeat_len, repeat_num)
+    scores = scores + bias
 
     attn_map = torch.softmax(scores, dim=-1)
     attn_map = rearrange(attn_map, 'h (it s1) s2 -> (h it) s1 s2', it=seqlen)
@@ -178,11 +306,52 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         q = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)
         k = rearrange(k, "b s (n d) -> (b s) n d", n=num_heads)
         v = rearrange(v, "b s (n d) -> (b s) n d", n=num_heads)
+        base_blockmask = attention_mask
+
+        # Adaptive backend: route dense when the sparse mask is too dense to pay off.
+        use_dense = False
+        if _ATTN_BACKEND == "dense":
+            use_dense = True
+        elif _ATTN_BACKEND == "auto" and _is_hopper_dev(q.device):
+            try:
+                density = base_blockmask.float().mean().item()
+            except Exception:
+                density = 1.0
+            use_dense = density >= _ATTN_DENSE_THRESH
+
+        if use_dense:
+            try:
+                # (S, n, d) -> (1, n, S, d) for fused dense SDPA, then back.
+                qd = q.unsqueeze(0).transpose(1, 2)
+                kd = k.unsqueeze(0).transpose(1, 2)
+                vd = v.unsqueeze(0).transpose(1, 2)
+                xd = _dense_sdpa((qd, kd, vd))             # (1, n, S, d)
+                x = xd.transpose(1, 2)                      # (1, S, n, d)
+                return rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+            except Exception:
+                torch.cuda.empty_cache()  # fall back to sparse
+
+        # Triton WGMMA block-sparse backend (opt-in, Hopper-guarded, exact mask).
+        if _ATTN_BACKEND == "triton" and _is_hopper_dev(q.device) and _TRITON_BSA is not None:
+            try:
+                # block mask -> (H, Nqb, Nkvb) bool ; q/k/v (S,n,d) -> (n,S,d)
+                bm = base_blockmask
+                if bm.dim() == 4:
+                    bm = bm[0]
+                bm = bm.bool()
+                qh = q.transpose(0, 1).contiguous()
+                kh = k.transpose(0, 1).contiguous()
+                vh = v.transpose(0, 1).contiguous()
+                xh = _TRITON_BSA(qh, kh, vh, bm)            # (n, S, d)
+                x = xh.transpose(0, 1).contiguous().unsqueeze(0)  # (1, S, n, d)
+                return rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+            except Exception:
+                torch.cuda.empty_cache()  # fall back to sparse
+
         cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
         cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
         head_mask_type = torch.tensor([1]*num_heads, device=q.device, dtype=torch.int32)
         streaming_info = None
-        base_blockmask = attention_mask
         max_seqlen_q_ = seqlen
         max_seqlen_k_ = seqlen_kv
         p_dropout = 0.0
@@ -236,8 +405,11 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
     return x
 
 
-def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
+def _modulate_impl(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
     return (x * (1 + scale) + shift)
+
+
+modulate = _maybe_compile(_modulate_impl)
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -273,6 +445,15 @@ def rope_apply(x, freqs, num_heads):
 # ----------------------------
 # Norms & Blocks
 # ----------------------------
+def _rmsnorm_impl(x, weight, eps):
+    dtype = x.dtype
+    out = x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + eps)
+    return out.to(dtype) * weight
+
+
+_rmsnorm_fused = _maybe_compile(_rmsnorm_impl)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
@@ -283,6 +464,8 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        if _FUSE_NORM:
+            return _rmsnorm_fused(x, self.weight, self.eps)
         dtype = x.dtype
         return self.norm(x.float()).to(dtype) * self.weight
 
@@ -429,11 +612,20 @@ class CrossAttention(nn.Module):
         return self.o(x)
 
 
+def _gate_impl(x, gate, residual):
+    return x + gate * residual
+
+
+_gate_fused = _maybe_compile(_gate_impl)
+
+
 class GateModule(nn.Module):
     def __init__(self,):
         super().__init__()
 
     def forward(self, x, gate, residual):
+        if _FUSE_NORM:
+            return _gate_fused(x, gate, residual)
         return x + gate * residual
 
 
@@ -454,12 +646,24 @@ class DiTBlock(nn.Module):
             approximate='tanh'), nn.Linear(ffn_dim, dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
+        # B1 lossless cache: (modulation + t_mod).chunk(6) is step-invariant.
+        self._mod_cache = None
+        self._mod_cache_key = None
 
     def forward(self, x, context, t_mod, freqs, f, h, w, local_num=None, topk=None,
                 train_img=False, block_id=None, kv_len=None, is_full_block=False,
                 is_stream=False, pre_cache_k=None, pre_cache_v=None, local_range = 9):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
+        if _CACHE_MOD:
+            key = (id(t_mod), t_mod.dtype, t_mod.device)
+            if self._mod_cache_key != key:
+                self._mod_cache = (
+                    self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
+                ).chunk(6, dim=1)
+                self._mod_cache_key = key
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._mod_cache
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         self_attn_output, self_attn_cache_k, self_attn_cache_v = self.self_attn(
             input_x, freqs, f, h, w, local_num, topk, train_img, block_id,
@@ -503,9 +707,21 @@ class Head(nn.Module):
         self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.head = nn.Linear(dim, out_dim * math.prod(patch_size))
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
+        # B1 lossless cache: (modulation + t_mod).chunk(2) is step-invariant.
+        self._mod_cache = None
+        self._mod_cache_key = None
 
     def forward(self, x, t_mod):
-        shift, scale = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(2, dim=1)
+        if _CACHE_MOD:
+            key = (id(t_mod), t_mod.dtype, t_mod.device)
+            if self._mod_cache_key != key:
+                self._mod_cache = (
+                    self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
+                ).chunk(2, dim=1)
+                self._mod_cache_key = key
+            shift, scale = self._mod_cache
+        else:
+            shift, scale = (self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(2, dim=1)
         x = (self.head(self.norm(x) * (1 + scale) + shift))
         return x
 
