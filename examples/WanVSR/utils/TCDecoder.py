@@ -27,11 +27,11 @@ TWorkItem = namedtuple("TWorkItem", ("input_tensor", "block_index"))
 # convs themselves run ~1.5x slower. Running the whole decoder in channels_last
 # removes the layout churn and speeds up the convs, with bit-identical math.
 #
-# Knob (opt-in by default ON; set 0 to disable):
+# Knob (opt-in, default OFF; set 1 to enable the NHWC fast path):
 #   FLASHVSR_TCDECODER_CHANNELS_LAST = 1 | 0
 # ---------------------------------------------------------------------------
 
-_TCDEC_CHANNELS_LAST = os.environ.get("FLASHVSR_TCDECODER_CHANNELS_LAST", "1") != "0"
+_TCDEC_CHANNELS_LAST = os.environ.get("FLASHVSR_TCDECODER_CHANNELS_LAST", "0") != "0"
 
 
 def _tcdec_channels_last_enabled(device=None):
